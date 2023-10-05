@@ -1,0 +1,169 @@
+---
+title: "Placental_Transcriptomic_Signatures_of_Prenatal_and_Preconceptional_Maternal_Stress"
+output: html_document
+date: "2023-10-04"
+---
+
+Starting with a DGE list
+```{r}
+# Load packages
+library(edgeR)
+library(openxlsx)
+library(BiocStyle)
+library(xtable)
+library(tximport)
+library(Glimma)
+library(org.Hs.eg.db)
+
+
+# Example loading a data frame saved previously
+example_data = readRDS("example_data.RDS")
+# Example loading a DGE list saved previously
+example_DGE = readRDS("example_DGE.RDS")
+
+# Filtering low expression genes out. Adjust to get > 10 counts per gene
+keep <- rowMeans(cpm(example_DGE, log = TRUE)) > 0
+example_DGE <- example_DGE[keep, , keep.lib.sizes = FALSE]
+example_DGE <- calcNormFactors(example_DGE)
+
+
+```
+
+Example complete case analysis
+```{r}
+design <- model.matrix(~prenatal_SLE + sex + age + education + income + neighborhood_deprivation + race + ethnicity + study_site + rna_batch  + household_size + delivery_method + gravidity+ labor_type + prepreg_bmi + maternal_tobacco + maternal_alcohol, example_data)
+
+fit <- eBayes(voomLmFit(example_DGE, design))
+
+top.table <- topTable(fit ,coef = "prenatal_SLE", sort.by = "P", n = Inf)
+```
+
+Example multiple imputation analysis. See RNAseqCovarImpute R package for more details at https://github.com/brennanhilton/RNAseqCovarImpute
+```{r}
+library(RNAseqCovarImpute)
+# Bin genes into smaller groups for imputation
+intervals = get_gene_bin_intervals(example_DGE, example_data)
+
+# Multiply impute the data
+gene_bin_impute = impute_by_gene_bin_parallel(example_data, intervals, example_DGE, m = 100)
+
+# Specify the design, same as above for complete case analysis
+adj_formula = "~prenatal_SLE + sex + age + education + income + neighborhood_deprivation + race + ethnicity + study_site + rna_batch  + household_size + delivery_method + gravidity+ labor_type + prepreg_bmi + maternal_tobacco + maternal_alcohol"
+
+all_coef_se_adj = limmavoom_imputed_data_list(gene_intervals = intervals, DGE = example_DGE, imputed_data_list =gene_bin_impute, m = 100, voom_formula = adj_formula, predictor = "prenatal_SLE")
+
+# Combine results with Rubins' rules
+rubins_res_adj = combine_rubins(example_DGE, all_coef_se_adj, adj_formula) %>% arrange(combined_p_bayes)
+```
+
+Gene set enrichment setup using the multiple imputation results
+```{r}
+# Get probe ENTREZID IDs
+annot = data.frame(ENSEMBL = as.character(rubins_res_adj$probe))
+annot$ENTREZID <- mapIds(org.Hs.eg.db, annot$ENSEMBL, "ENTREZID","ENSEMBL")
+
+# remove na ENTREZID and duplicates. another option is averaging where multiple ENSEMBL IDs map to same ENTREZID
+rubins_res_adj = rubins_res_adj %>% left_join(annot) %>% 
+  filter(!is.na(ENTREZID))
+
+remove = rubins_res_adj %>% filter(duplicated(ENTREZID)) %>% pull(ENTREZID)
+rubins_res_adj = rubins_res_adj %>%
+  filter(!ENTREZID %in% remove)
+
+# Build gene index for kegg and mutsigdb
+library(EGSEA)
+gs.annots.both = buildIdx(entrezIDs = rubins_res_adj$ENTREZID, species = "human",
+msigdb.gsets = "h", kegg.exclude = c("Disease"))
+
+# make a names vector of the t statistics from RNAseqcovarImpute. Names are entrezid
+y = rubins_res_adj$rubins_t_bayes
+y_names = rubins_res_adj$ENTREZID
+y = setNames(y, y_names)
+```
+
+Camera
+```{r}
+camera_res_h = cameraPR(statistic = y, index = gs.annots.both$h$original)
+camera_res_kegg = cameraPR(statistic = y, index = gs.annots.both$kegg$original)
+camera_res_h$pathway = rownames(camera_res_h)
+camera_res_kegg$pathway = rownames(camera_res_kegg)
+camera_res_h$Method = "Camera"
+camera_res_kegg$Method = "Camera"
+```
+
+gage
+```{r}
+library(gage)
+MI_res = rubins_res_adj %>% 
+  dplyr::select(ENTREZID, rubins_t_bayes)
+
+# Needs to be in this matrix with rownames format rather than a data frame.
+MI_res2 = MI_res %>% dplyr::select(rubins_t_bayes)
+MI_res2 = as.matrix(MI_res2)
+rownames(MI_res2)<-MI_res$ENTREZID
+
+# Kegg
+fc.kegg.p <- gage(MI_res2, gsets = gs.annots.both$kegg$original, ref = NULL, samp = NULL)
+# msigdb Hallmark
+fc.h.p <- gage(MI_res2, gsets = gs.annots.both$h$original, ref = NULL, samp = NULL)
+
+# Gage tests all pathways separately for each direction of change. Adding the two directions together here and renaming some variables.
+gage_res_kegg = fc.kegg.p$greater %>% rbind(fc.kegg.p$less) 
+gage_names_kegg = rownames(gage_res_kegg)
+gage_res_kegg = gage_res_kegg %>% 
+  as_tibble() %>% 
+  mutate(pathway = gage_names_kegg) %>% 
+  arrange(q.val) %>% 
+  mutate(Direction = ifelse(stat.mean>0, "Up", "Down")) %>% 
+  dplyr::rename(PValue = p.val, FDR = q.val) %>% 
+  dplyr::select(Direction, PValue, FDR, pathway, everything()) %>% 
+  mutate(Method = "GAGE")
+
+
+gage_res_h = fc.h.p$less %>% rbind(fc.h.p$greater)
+gage_names_h = rownames(gage_res_h)
+gage_res_h = gage_res_h %>% 
+  as_tibble() %>% 
+  mutate(pathway = gage_names_h) %>% 
+  arrange(q.val) %>% 
+  mutate(Direction = ifelse(stat.mean>0, "Up", "Down")) %>% 
+  dplyr::rename(PValue = p.val, FDR = q.val) %>% 
+  dplyr::select(Direction, PValue, FDR, pathway, everything()) %>% 
+  mutate(Method = "GAGE")
+
+```
+
+EGSEA (run on complete case results in this example)
+```{r}
+design <- model.matrix(~prenatal_SLE + sex + age + education + income + neighborhood_deprivation + race + ethnicity + study_site + rna_batch  + household_size + delivery_method + gravidity+ labor_type + prepreg_bmi + maternal_tobacco + maternal_alcohol, example_data)
+
+voom_adj <- voom(example_DGE, design)
+# remove na ENTREZID and duplicates. another option is averaging where multiple ENSEMBL IDs map to same ENTREZID
+geneIDs = tibble(example_DGE$genes)%>% filter(!is.na(ENTREZID)) 
+remove = geneIDs %>% filter(duplicated(ENTREZID)) %>% pull(ENTREZID)
+geneIDs = geneIDs %>% filter(!ENTREZID %in% remove)
+
+voom_adj = voom_adj[geneIDs$ENSEMBL,]
+rownames(voom_adj) <- geneIDs$ENTREZID
+
+
+# remove gage because of bug in egsea
+library(EGSEA)
+baseMethods1 = egsea.base()
+baseMethods = baseMethods1[!baseMethods1 %in% c("gage")]
+# Build gene index for kegg and mutsigdb
+gs.annots.both = buildIdx(entrezIDs = rownames(voom_adj), species = "human",
+msigdb.gsets = "h", kegg.exclude = c("Disease"))
+
+gsa_adj_both = egsea(voom.results = voom_adj, gs.annots = gs.annots.both, symbolsMap = voom_adj$genes, baseGSEAs = baseMethods, report = FALSE)
+
+# msigdb Hallmark
+gsa_adj_res_hallmark = topSets(gsa_adj_both, names.only = FALSE, n = Inf, gs.label = "h")
+gsa_adj_res_hallmark = gsa_adj_res_hallmark %>% mutate(SET = rownames(gsa_adj_res_hallmark))
+
+# Kegg
+gsa_adj_res_kegg = topSets(gsa_adj_both, names.only = FALSE, n = Inf, gs.label = "kegg")
+gsa_adj_res_kegg = gsa_adj_res_kegg %>% mutate(SET = rownames(gsa_adj_res_kegg))
+
+```
+
